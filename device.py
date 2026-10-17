@@ -1,12 +1,17 @@
-"""设备抽象层：把「旋转电机 + 激光测距仪」封装成统一接口。
+"""设备抽象层：蓝牙激光测距仪 + 模拟设备。
 
-本模块提供：
+通讯协议
+--------
+测距仪每转一圈返回 ``points_per_turn`` 帧，每帧为 ``{点序号, 距离}``::
 
-* :class:`BaseDevice`  —— 设备抽象基类，定义旋转 / 测距的最小接口。
-* :class:`MockDevice`  —— 无硬件时的模拟设备，按房间轮廓生成距离数据。
-* :class:`BleDevice`   —— 基于 bleak 的蓝牙实现（通讯协议待定，内含 TODO）。
-* :class:`BleScanner`  —— 后台线程中扫描 BLE 设备，供设置对话框使用。
-* :func:`create_device` —— 按配置挑选并构造设备（蓝牙不可用时自动回退到模拟）。
+    device.connect()
+    device.start_scan(points_per_turn)     # 下发启动指令，测距仪开始转
+    for _ in range(points_per_turn):
+        frame = device.read_frame()        # 阻塞读取一帧
+        angle = frame_angle_deg(frame.index, points_per_turn)
+    device.stop_scan()                     # 下发停止指令
+
+:meth:`BaseDevice.query_info` 用于「关于」页：发送查询指令并解析测距仪信息。
 
 角度约定：0° 指向 +x 轴，逆时针增大；距离单位为米。
 """
@@ -17,39 +22,62 @@ import abc
 import asyncio
 import logging
 import math
+import queue
 import random
+import re
+import struct
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
 __all__ = [
     "DeviceError",
+    "Frame",
+    "frame_angle_deg",
     "BaseDevice",
     "MockDevice",
     "SimulatedDevice",
     "BleDevice",
     "BleScanner",
-    "create_device",
-    "MODE_AUTO",
-    "MODE_MOCK",
-    "MODE_BLE",
+    "DEFAULT_POINTS_PER_TURN",
 ]
 
 logger = logging.getLogger(__name__)
 
-# --------------------------------------------------------------------------- #
-# 设备模式常量
-# --------------------------------------------------------------------------- #
-
-MODE_AUTO = "auto"  # 优先蓝牙，失败或未配置地址时回退到模拟设备
-MODE_MOCK = "mock"  # 强制使用模拟设备
-MODE_BLE = "ble"    # 强制使用蓝牙设备
+#: 「测距仪转一圈共返回多少个点」的默认值
+DEFAULT_POINTS_PER_TURN = 720
 
 
 class DeviceError(RuntimeError):
     """设备连接或通讯失败时抛出。"""
+
+
+# --------------------------------------------------------------------------- #
+# 数据帧
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class Frame:
+    """测距仪返回的一帧：``{点序号, 距离}``。"""
+
+    index: int
+    """点序号，由测距仪给出。"""
+
+    distance: float
+    """该点测得的距离（米）。"""
+
+
+def frame_angle_deg(index: int, points_per_turn: int) -> float:
+    """点序号 → 角度（度）：``点序号 / 一圈点数 * 360``。
+
+    点序号按一圈取模，兼容测距仪从 0 或 1 开始计数、以及跨圈累加的实现。
+    """
+    pts = max(1, int(points_per_turn))
+    return (int(index) % pts) / pts * 360.0
 
 
 # --------------------------------------------------------------------------- #
@@ -58,27 +86,16 @@ class DeviceError(RuntimeError):
 
 
 class BaseDevice(abc.ABC):
-    """旋转电机 + 激光测距仪的统一接口。
+    """激光测距仪的统一接口。
 
-    一次典型测量流程为::
-
-        device.connect()
-        device.rotate_to(angle)
-        distance = device.read_distance()
-        device.disconnect()
-
-    子类需要实现 :meth:`connect` / :meth:`disconnect` / :meth:`rotate_to` /
-    :meth:`read_distance` 四个方法。
+    一次完整采集为 ``connect`` → ``start_scan`` → 逐帧 ``read_frame`` →
+    ``stop_scan`` → ``disconnect``。连接是长期持有的：同一个设备对象可以连续
+    发起多次采集，因此 :meth:`stop_scan` 只停转，不断开。
     """
 
-    def __init__(self, *, speed_rpm: float = 12.0, sample_interval: float = 0.05) -> None:
-        """
-        :param speed_rpm: 电机转速（转/分钟），用于估算转到目标角度的耗时。
-        :param sample_interval: 两次采样之间的时间间隔（秒）。
-        """
-        self.speed_rpm: float = float(speed_rpm)
-        self.sample_interval: float = float(sample_interval)
+    def __init__(self) -> None:
         self._connected: bool = False
+        self._points_per_turn: int = DEFAULT_POINTS_PER_TURN
 
     # -- 状态 -------------------------------------------------------------- #
 
@@ -88,14 +105,14 @@ class BaseDevice(abc.ABC):
         return self._connected
 
     @property
+    def points_per_turn(self) -> int:
+        """本次（或最近一次）采集设定的一圈点数。"""
+        return self._points_per_turn
+
+    @property
     @abc.abstractmethod
     def name(self) -> str:
         """设备显示名称，用于状态栏提示。"""
-
-    @property
-    def degrees_per_sample(self) -> float:
-        """按当前转速与采样间隔估算的角度步进（度）。"""
-        return max(0.1, self.speed_rpm * 360.0 / 60.0 * self.sample_interval)
 
     # -- 生命周期 ---------------------------------------------------------- #
 
@@ -107,19 +124,25 @@ class BaseDevice(abc.ABC):
     def disconnect(self) -> None:
         """断开连接并释放资源。重复调用应当安全。"""
 
-    # -- 动作 -------------------------------------------------------------- #
+    # -- 采集 -------------------------------------------------------------- #
 
     @abc.abstractmethod
-    def rotate_to(self, angle_deg: float) -> None:
-        """把电机旋转到指定角度（度）。"""
+    def start_scan(self, points_per_turn: int) -> None:
+        """下发启动指令，让测距仪按 ``points_per_turn`` 个点转一圈。"""
 
     @abc.abstractmethod
-    def read_distance(self) -> float:
-        """读取一次激光测距结果，返回米。"""
+    def read_frame(self) -> Frame:
+        """阻塞读取下一帧。超时或失败时抛出 :class:`DeviceError`。"""
 
-    def set_speed(self, speed_rpm: float) -> None:
-        """设置电机转速（转/分钟）。"""
-        self.speed_rpm = max(0.1, float(speed_rpm))
+    def stop_scan(self) -> None:
+        """下发停止指令。默认什么都不做。"""
+        return None
+
+    # -- 设备信息 ---------------------------------------------------------- #
+
+    def query_info(self) -> dict[str, str]:
+        """查询测距仪信息（关于页展示）。默认返回空字典。"""
+        return {}
 
     # -- 上下文管理 -------------------------------------------------------- #
 
@@ -139,9 +162,9 @@ class BaseDevice(abc.ABC):
 class MockDevice(BaseDevice):
     """无硬件时使用的模拟设备。
 
-    内部维护一个闭合的房间多边形（矩形 + 一个壁龛），从原点按当前角度做射线
-    求交，得到该方向上的距离。数据叠加少量高斯噪声与偶发跳变，便于演示平滑
-    滤波与分段直线拟合的效果。
+    内部维护一个闭合的房间多边形（矩形 + 一个壁龛），从原点按角度做射线求交，
+    得到该方向上的距离。数据叠加少量高斯噪声与偶发跳变，便于演示平滑滤波与
+    分段直线拟合的效果。
     """
 
     #: 房间轮廓顶点（米），逆时针闭合多边形；原点 (0, 0) 位于房间内部。
@@ -157,20 +180,20 @@ class MockDevice(BaseDevice):
     def __init__(
         self,
         *,
-        speed_rpm: float = 12.0,
-        sample_interval: float = 0.05,
         room: Sequence[tuple[float, float]] | None = None,
         noise_std: float = 0.012,
         outlier_rate: float = 0.02,
+        frame_interval: float = 0.004,
         seed: int | None = None,
     ) -> None:
         """
         :param room: 自定义房间多边形，默认使用 :attr:`DEFAULT_ROOM`。
         :param noise_std: 高斯噪声标准差（米）。
         :param outlier_rate: 单点跳变出现的概率，用于检验中值滤波。
+        :param frame_interval: 每帧之间的模拟耗时（秒）。
         :param seed: 随机数种子，便于复现。
         """
-        super().__init__(speed_rpm=speed_rpm, sample_interval=sample_interval)
+        super().__init__()
         self._room: tuple[tuple[float, float], ...] = tuple(
             room if room is not None else self.DEFAULT_ROOM
         )
@@ -179,9 +202,9 @@ class MockDevice(BaseDevice):
 
         self.noise_std = float(noise_std)
         self.outlier_rate = float(outlier_rate)
+        self.frame_interval = max(0.0, float(frame_interval))
         self._rng = random.Random(seed)
-        self._angle: float = 0.0
-        self._distance: float = self._ray_cast(0.0)
+        self._index: int = 0
 
     # -- BaseDevice 接口 --------------------------------------------------- #
 
@@ -197,35 +220,33 @@ class MockDevice(BaseDevice):
     def disconnect(self) -> None:
         self._connected = False
 
-    def rotate_to(self, angle_deg: float) -> None:
-        """记录目标角度，并按转速模拟转动耗时。"""
-        if not self._connected:
-            raise DeviceError("设备未连接，无法旋转")
+    def start_scan(self, points_per_turn: int) -> None:
+        self._require_connected()
+        self._points_per_turn = max(1, int(points_per_turn))
+        self._index = 0
 
-        target = float(angle_deg)
-        delta = abs(target - self._angle)
-        # 取一圈内的最短路径耗时，避免跨 360° 时等待过久
-        travel = min(delta, 360.0 - (delta % 360.0)) if delta % 360.0 else delta
-        angular_speed = max(1e-3, self.speed_rpm * 6.0)  # 度/秒
-        time.sleep(min(travel / angular_speed, 0.5))
+    def read_frame(self) -> Frame:
+        """产生下一帧：按点序号折算角度，再对房间轮廓做射线求交。"""
+        self._require_connected()
 
-        self._angle = target
-        self._distance = self._ray_cast(target)
+        if self.frame_interval:
+            time.sleep(self.frame_interval)
 
-    def read_distance(self) -> float:
-        """返回当前角度上的距离，附带噪声与偶发跳变。"""
-        if not self._connected:
-            raise DeviceError("设备未连接，无法测距")
+        index = self._index
+        self._index += 1
+        angle = frame_angle_deg(index, self._points_per_turn)
 
-        time.sleep(min(self.sample_interval, 0.2))
-
-        value = self._distance + self._rng.gauss(0.0, self.noise_std)
+        value = self._ray_cast(angle) + self._rng.gauss(0.0, self.noise_std)
         if self._rng.random() < self.outlier_rate:
             # 模拟反光 / 遮挡导致的跳变点
             value += self._rng.choice((-1.0, 1.0)) * self._rng.uniform(0.08, 0.25)
-        return max(0.05, value)
+        return Frame(index=index, distance=max(0.05, value))
 
     # -- 内部工具 ---------------------------------------------------------- #
+
+    def _require_connected(self) -> None:
+        if not self._connected:
+            raise DeviceError("设备未连接")
 
     def _ray_cast(self, angle_deg: float) -> float:
         """从原点沿给定角度发射射线，返回与房间轮廓的最近交点距离。"""
@@ -262,24 +283,17 @@ class SimulatedDevice(MockDevice):
     * 它代表「本来要跟某台真实设备通信」的那种运行方式，因此会把**本应下发的
       指令**逐条记录下来并写入日志，方便在没有硬件时核对指令流与时序；
     * 它绝不会打开蓝牙连接，因此不会因为适配器缺失、设备不在范围内、协议
-      未确定而失败——勾选「模拟运行」后点「绘制」必定能跑完流程。
+      未确定而失败——勾选「模拟运行」后点「绘制 → 开始」必定能跑完流程。
 
     测距值仍由 :class:`MockDevice` 的房间轮廓生成，因此绘制出来的图形与真实
     房间拓扑一致，适合演示与回归测试。
     """
 
-    def __init__(
-        self,
-        *,
-        target: str = "",
-        speed_rpm: float = 12.0,
-        sample_interval: float = 0.05,
-        seed: int | None = None,
-    ) -> None:
+    def __init__(self, *, target: str = "", **kwargs: Any) -> None:
         """
         :param target: 本应通信的目标设备描述，仅用于提示与日志。
         """
-        super().__init__(speed_rpm=speed_rpm, sample_interval=sample_interval, seed=seed)
+        super().__init__(**kwargs)
         self.target: str = target.strip() or "（未指定设备）"
         #: 本次运行中「本应下发」的指令，按顺序记录
         self.command_log: list[str] = []
@@ -296,19 +310,34 @@ class SimulatedDevice(MockDevice):
         logger.info("模拟运行：跳过真实连接，目标设备 %s", self.target)
         super().connect()
 
-    def rotate_to(self, angle_deg: float) -> None:
-        """记录本应下发的电机指令，然后按模拟角度继续。"""
+    def start_scan(self, points_per_turn: int) -> None:
+        """记录本应下发的启动指令，然后进入模拟采集。"""
         # TODO: 协议确定后，这里可以改成「把指令交给 BleDevice 编码但不发送」，
         #       用来验证真实报文长度、字节序与超时设置。
-        self.command_log.append(f"MOTOR -> {angle_deg:.2f} deg")
-        logger.debug("模拟下发指令 #%d：MOTOR -> %.2f deg", len(self.command_log), angle_deg)
-        super().rotate_to(angle_deg)
+        self.command_log.append(f"START points_per_turn={int(points_per_turn)}")
+        logger.debug("模拟下发指令 #%d：START", len(self.command_log))
+        super().start_scan(points_per_turn)
 
-    def read_distance(self) -> float:
-        """返回模拟测距值。"""
-        value = super().read_distance()
-        logger.debug("模拟返回测距值：%.4f m", value)
-        return value
+    def read_frame(self) -> Frame:
+        frame = super().read_frame()
+        logger.debug("模拟返回第 %d 帧：%.4f m", frame.index, frame.distance)
+        return frame
+
+    def stop_scan(self) -> None:
+        self.command_log.append("STOP")
+        logger.debug("模拟下发指令 #%d：STOP", len(self.command_log))
+        super().stop_scan()
+
+    def query_info(self) -> dict[str, str]:
+        """模拟运行下不发送任何查询指令，直接返回一组固定的设备信息。"""
+        self.command_log.append("INFO")
+        return {
+            "设备": "模拟测距仪",
+            "型号": "SIM-2D",
+            "固件版本": "0.0.0-sim",
+            "一圈点数": str(self._points_per_turn),
+            "说明": "模拟运行，数据由内置房间轮廓生成，未进行任何真实通信。",
+        }
 
     @property
     def commands_sent(self) -> int:
@@ -322,47 +351,64 @@ class SimulatedDevice(MockDevice):
 
 
 class BleDevice(BaseDevice):
-    """基于 ``bleak`` 的蓝牙设备实现。
+    """基于 ``bleak`` 的蓝牙测距仪实现。
 
     .. warning::
-       真实设备的 GATT 服务 / 特征 UUID、写入命令格式与测距报文解析方式尚未
-       确定，相关位置均以 ``TODO`` 标注。在协议补齐之前，:meth:`connect` 会
-       抛出 :class:`DeviceError`，由 :func:`create_device` 回退到
-       :class:`MockDevice`，因此界面仍可正常演示。
+       真实设备的 GATT 特征 UUID、启动 / 停止 / 查询指令的报文格式以及
+       「点序号 + 距离」帧的解析方式尚未确定，相应位置均以 ``TODO`` 标注。
+       在协议确定之前：
+
+       * UUID 留空时会**自动发现**——从设备已发布的服务里挑第一个可写特征作为
+         控制通道、第一个 notify/indicate 特征作为数据通道、第一个可读特征作为
+         信息通道，因此拿到真机即可先行联调；
+       * :meth:`start_scan` / :meth:`stop_scan` / :meth:`query_info` 的指令载荷
+         与 :meth:`parse_frame` / :meth:`parse_info` 采用**文档化的默认格式**，
+         协议确定后只需替换这几个位置。
 
     ``bleak`` 是异步 API，这里在后台线程中常驻一个事件循环，对外暴露同步方法，
-    方便被扫描线程直接调用。
+    方便被采集线程直接调用。
     """
 
     # ------------------------------------------------------------------ #
-    # TODO: 协议确定后填写以下常量
+    # TODO: 协议确定后填写以下 UUID（留 None 表示自动发现）
     # ------------------------------------------------------------------ #
     #: 主服务 UUID
     SERVICE_UUID: str | None = None
-    #: 电机控制特征 UUID（写入）
-    MOTOR_CHAR_UUID: str | None = None
-    #: 测距数据特征 UUID（通知 / 读取）
-    RANGE_CHAR_UUID: str | None = None
-    #: 使能激光的特征 UUID（可选）
-    LASER_CHAR_UUID: str | None = None
+    #: 控制特征 UUID（写入启动 / 停止 / 查询指令）
+    CONTROL_CHAR_UUID: str | None = None
+    #: 数据特征 UUID（notify 推送 {点序号, 距离} 帧）
+    FRAME_CHAR_UUID: str | None = None
+    #: 信息特征 UUID（查询响应）
+    INFO_CHAR_UUID: str | None = None
+
+    # ------------------------------------------------------------------ #
+    # TODO: 协议确定后替换为真实指令报文
+    # ------------------------------------------------------------------ #
+    #: 启动采集指令（后接 uint16 小端的一圈点数）
+    START_CMD: bytes = b"START"
+    #: 停止采集指令
+    STOP_CMD: bytes = b"STOP"
+    #: 查询设备信息指令
+    INFO_CMD: bytes = b"INFO"
+
     #: 一次写入命令的超时时间（秒）
     WRITE_TIMEOUT: float = 5.0
-    #: 单次读取测距值的超时时间（秒）
+    #: 等待一帧 / 一次查询响应的超时时间（秒）
     READ_TIMEOUT: float = 5.0
+    #: 接收缓冲上限（帧）。暂停接收时通知仍会到达，超出后丢弃最旧的帧。
+    MAX_BACKLOG_FRAMES: int = 8192
 
     def __init__(
         self,
         address: str,
         *,
-        speed_rpm: float = 12.0,
-        sample_interval: float = 0.05,
         connect_timeout: float = 15.0,
     ) -> None:
         """
         :param address: 蓝牙设备地址，例如 ``AA:BB:CC:DD:EE:FF``。
         :param connect_timeout: 连接超时时间（秒）。
         """
-        super().__init__(speed_rpm=speed_rpm, sample_interval=sample_interval)
+        super().__init__()
         if not address or not address.strip():
             raise DeviceError("未配置蓝牙设备地址")
 
@@ -372,17 +418,26 @@ class BleDevice(BaseDevice):
         self._client: Any | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
-        self._latest_distance: float | None = None  # 由通知回调写入
         self._lock = threading.Lock()
+
+        # 实际使用的特征 UUID（协议未定时由自动发现填充）
+        self._control_uuid: str | None = None
+        self._frame_uuid: str | None = None
+        self._info_uuid: str | None = None
+
+        self._frames: queue.Queue[Frame] = queue.Queue()
+        self._notify_active: bool = False
+        self._info_reply: bytes | None = None
+        self._info_event = threading.Event()
 
     # -- BaseDevice 接口 --------------------------------------------------- #
 
     @property
     def name(self) -> str:
-        return f"蓝牙设备 {self.address}"
+        return f"蓝牙测距仪 {self.address}"
 
     def connect(self) -> None:
-        """连接设备并订阅测距通知。"""
+        """连接设备、解析特征并订阅数据通知。"""
         self._ensure_loop()
         self._run(self._connect_async(), timeout=self.connect_timeout)
         self._connected = True
@@ -395,43 +450,93 @@ class BleDevice(BaseDevice):
             except Exception:  # noqa: BLE001 - 断开失败不应阻塞退出
                 pass
         self._connected = False
+        self._notify_active = False
         self._client = None
         self._shutdown_loop()
+        with self._lock:
+            while True:
+                try:
+                    self._frames.get_nowait()
+                except queue.Empty:
+                    break
 
-    def rotate_to(self, angle_deg: float) -> None:
-        """向电机写入目标角度。
+    def start_scan(self, points_per_turn: int) -> None:
+        """下发启动指令，让测距仪按指定点数转一圈。"""
+        self._require_connected()
+        if self._control_uuid is None:
+            raise DeviceError("未找到可写的控制特征，无法下发启动指令")
 
-        TODO: 协议确定后替换为真实指令，例如::
+        self._points_per_turn = max(1, int(points_per_turn))
+        with self._lock:
+            while True:
+                try:
+                    self._frames.get_nowait()
+                except queue.Empty:
+                    break
 
-            payload = struct.pack("<f", math.radians(angle_deg))
-            await client.write_gatt_char(self.MOTOR_CHAR_UUID, payload, response=True)
-            await asyncio.sleep(该角度所需转动时间)  # 或等待电机到位通知
+        payload = self.START_CMD + struct.pack("<H", min(65535, self._points_per_turn))
+        self._run(self._write_async(payload), timeout=self.WRITE_TIMEOUT)
+        logger.info("已向 %s 下发启动指令（一圈 %d 点）", self.address, self._points_per_turn)
+
+    def stop_scan(self) -> None:
+        """下发停止指令；失败只记录日志，不打断界面收尾。"""
+        if not self._connected or self._control_uuid is None:
+            return
+        try:
+            self._run(self._write_async(self.STOP_CMD), timeout=self.WRITE_TIMEOUT)
+        except DeviceError as exc:
+            logger.warning("下发停止指令失败：%s", exc)
+
+    def read_frame(self) -> Frame:
+        """阻塞读取下一帧 ``{点序号, 距离}``。
+
+        设备推送通知时从缓冲区取；设备只支持读取时退回主动读特征值。
         """
         self._require_connected()
-        if self.MOTOR_CHAR_UUID is None:
-            raise DeviceError("蓝牙电机控制 UUID 未配置（协议待定）")
 
-        self._run(self._rotate_async(angle_deg), timeout=self.WRITE_TIMEOUT)
+        if self._notify_active:
+            try:
+                return self._frames.get(timeout=self.READ_TIMEOUT)
+            except queue.Empty:
+                raise DeviceError(
+                    f"等待测距帧超时（{self.READ_TIMEOUT:.0f} 秒未收到数据）"
+                ) from None
 
-    def read_distance(self) -> float:
-        """读取一次测距结果（米）。
+        if self._frame_uuid is None:
+            raise DeviceError("未找到测距数据特征（notify 或 read）")
+        raw = self._run(self._read_char_async(self._frame_uuid), timeout=self.READ_TIMEOUT)
+        return self.parse_frame(bytes(raw))
 
-        TODO: 协议确定后替换为真实报文解析，例如::
-
-            raw = await client.read_gatt_char(self.RANGE_CHAR_UUID)
-            return int.from_bytes(raw[2:4], "little") / 1000.0
-        """
+    def query_info(self) -> dict[str, str]:
+        """发送查询指令并解析测距仪信息（关于页使用）。"""
         self._require_connected()
-        if self.RANGE_CHAR_UUID is None:
-            raise DeviceError("蓝牙测距 UUID 未配置（协议待定）")
+        if self._control_uuid is None:
+            raise DeviceError("未找到可写的控制特征，无法下发查询指令")
 
-        value = self._run(self._read_async(), timeout=self.READ_TIMEOUT)
-        return float(value)
+        self._info_reply = None
+        self._info_event.clear()
+        self._run(self._write_async(self.INFO_CMD), timeout=self.WRITE_TIMEOUT)
+        logger.info("已向 %s 下发信息查询指令，等待响应…", self.address)
+
+        if self._info_event.wait(timeout=self.READ_TIMEOUT):
+            return self.parse_info(self._info_reply or b"")
+
+        # 设备不推送响应时，退回直接读取信息特征
+        if self._info_uuid is not None:
+            try:
+                raw = self._run(
+                    self._read_char_async(self._info_uuid), timeout=self.READ_TIMEOUT
+                )
+                return self.parse_info(bytes(raw))
+            except DeviceError as exc:
+                logger.debug("直接读取设备信息失败：%s", exc)
+
+        raise DeviceError(f"未收到测距仪信息响应（等待 {self.READ_TIMEOUT:.0f} 秒）")
 
     # -- 异步实现 ---------------------------------------------------------- #
 
     async def _connect_async(self) -> None:
-        """建立 BLE 连接并订阅通知。"""
+        """建立 BLE 连接、解析特征并订阅数据通知。"""
         try:
             from bleak import BleakClient  # 延迟导入，缺少依赖时不影响模拟模式
         except ImportError as exc:  # pragma: no cover - 取决于运行环境
@@ -447,72 +552,147 @@ class BleDevice(BaseDevice):
             raise DeviceError(f"连接蓝牙设备失败：{self.address} 未进入已连接状态")
 
         self._client = client
+        self._resolve_characteristics(client)
+        logger.info(
+            "已连接 %s（控制=%s 数据=%s 信息=%s）",
+            self.address, self._control_uuid, self._frame_uuid, self._info_uuid,
+        )
 
-        # TODO: 协议确定后校验服务与特征是否存在，例如
-        #   services = client.services
-        #   if self.SERVICE_UUID not in [s.uuid for s in services]:
-        #       raise DeviceError("目标服务不存在")
-        if self.RANGE_CHAR_UUID is not None:
+        if self._frame_uuid is not None:
             try:
-                await client.start_notify(self.RANGE_CHAR_UUID, self._on_notify)
+                await client.start_notify(self._frame_uuid, self._on_frame_notify)
+                self._notify_active = True
             except Exception as exc:  # noqa: BLE001
-                raise DeviceError(f"订阅测距通知失败：{exc}") from exc
+                # 该特征可能不支持通知，退回主动读取
+                logger.warning("订阅测距数据通知失败，将改用主动读取：%s", exc)
+                self._notify_active = False
+
+        if self._info_uuid is not None and self._info_uuid != self._frame_uuid:
+            try:
+                await client.start_notify(self._info_uuid, self._on_info_notify)
+            except Exception:  # noqa: BLE001 - 只读特征不支持通知，查询时退回读取
+                logger.debug("信息特征不支持通知，查询时将直接读取")
 
     async def _disconnect_async(self) -> None:
         client = self._client
         if client is None:
             return
-        if self.RANGE_CHAR_UUID is not None:
+        for uuid in {self._frame_uuid, self._info_uuid} - {None}:
             try:
-                await client.stop_notify(self.RANGE_CHAR_UUID)
+                await client.stop_notify(uuid)
             except Exception:  # noqa: BLE001 - 忽略取消订阅失败
                 pass
         await client.disconnect()
 
-    async def _rotate_async(self, angle_deg: float) -> None:
-        """TODO: 按真实协议写入电机指令。"""
+    async def _write_async(self, payload: bytes) -> None:
+        """把指令写入控制特征。"""
         client = self._client
         if client is None:
             raise DeviceError("蓝牙设备未连接")
+        # response=None：由 bleak 按特征属性自动选择带响应 / 不带响应写入
+        await client.write_gatt_char(self._control_uuid, payload, response=None)
 
-        # 协议待定：保留写入骨架，便于协议确定后直接补全。
-        payload = str(angle_deg).encode("ascii")  # 占位载荷，勿用于真实设备
-        await client.write_gatt_char(self.MOTOR_CHAR_UUID, payload, response=True)
-        await asyncio.sleep(self.sample_interval)
-
-    async def _read_async(self) -> float:
-        """TODO: 解析真实测距报文。"""
+    async def _read_char_async(self, uuid: str) -> bytes:
         client = self._client
         if client is None:
             raise DeviceError("蓝牙设备未连接")
+        raw = await client.read_gatt_char(uuid)
+        return bytes(raw)
 
-        with self._lock:
-            if self._latest_distance is not None:
-                return self._latest_distance
+    # -- 特征解析 ---------------------------------------------------------- #
 
-        raw = await client.read_gatt_char(self.RANGE_CHAR_UUID)
-        return self.parse_distance(bytes(raw))
+    def _resolve_characteristics(self, client: Any) -> None:
+        """确定控制 / 数据 / 信息三个特征。
+
+        类常量已配置时直接采用；留空时从设备已发布的服务里自动发现，这样在协议
+        UUID 尚未确定的情况下也能先连上真机联调。
+        """
+        self._control_uuid = self.CONTROL_CHAR_UUID
+        self._frame_uuid = self.FRAME_CHAR_UUID
+        self._info_uuid = self.INFO_CHAR_UUID
+        if self._control_uuid and self._frame_uuid:
+            return
+
+        try:
+            services = list(client.services)
+        except Exception as exc:  # noqa: BLE001 - 服务枚举失败时保留已配置的 UUID
+            logger.warning("枚举蓝牙服务失败，无法自动发现特征：%s", exc)
+            return
+
+        for service in services:
+            service_uuid = str(getattr(service, "uuid", "") or "")
+            if self.SERVICE_UUID and service_uuid.lower() != self.SERVICE_UUID.lower():
+                continue
+            for char in getattr(service, "characteristics", []) or []:
+                uuid = str(getattr(char, "uuid", "") or "")
+                if not uuid:
+                    continue
+                properties = {str(p).lower() for p in getattr(char, "properties", []) or []}
+                if not self._control_uuid and properties & {"write", "write-without-response"}:
+                    self._control_uuid = uuid
+                if not self._frame_uuid and properties & {"notify", "indicate"}:
+                    self._frame_uuid = uuid
+                if not self._info_uuid and "read" in properties:
+                    self._info_uuid = uuid
 
     # -- 回调与解析 -------------------------------------------------------- #
 
-    def _on_notify(self, _sender: Any, data: bytearray) -> None:
-        """测距通知回调：解析后缓存最新值。"""
+    def _on_frame_notify(self, _sender: Any, data: bytearray) -> None:
+        """数据通知回调：解析后入队，供 :meth:`read_frame` 取用。"""
         try:
-            value = self.parse_distance(bytes(data))
-        except Exception:  # noqa: BLE001 - 单条报文异常不应中断扫描
+            frame = self.parse_frame(bytes(data))
+        except Exception:  # noqa: BLE001 - 单帧报文异常不应中断采集
+            logger.debug("忽略无法解析的数据帧", exc_info=True)
             return
+
         with self._lock:
-            self._latest_distance = value
+            if self._frames.qsize() >= self.MAX_BACKLOG_FRAMES:
+                # 暂停接收期间通知仍会到达，只保留最新的一批
+                try:
+                    self._frames.get_nowait()
+                except queue.Empty:
+                    pass
+            self._frames.put(frame)
+
+    def _on_info_notify(self, _sender: Any, data: bytearray) -> None:
+        """信息响应回调。"""
+        self._info_reply = bytes(data)
+        self._info_event.set()
 
     @staticmethod
-    def parse_distance(raw: bytes) -> float:
-        """把原始报文解析为距离（米）。
+    def parse_frame(raw: bytes) -> Frame:
+        """把数据帧报文解析为 :class:`Frame`。
 
-        TODO: 协议确定后按真实格式实现，例如::
+        TODO: 协议确定后按真实格式实现。默认布局为 6 字节小端::
 
-            return int.from_bytes(raw[2:4], "little") / 1000.0
+            偏移 0..1  uint16  点序号
+            偏移 2..5  uint32  距离（毫米）
         """
-        raise DeviceError("测距报文解析尚未实现（协议待定）")
+        if len(raw) < 6:
+            raise DeviceError(f"数据帧长度不足：{len(raw)} 字节")
+        index, millimeters = struct.unpack_from("<HI", raw, 0)
+        return Frame(index=int(index), distance=int(millimeters) / 1000.0)
+
+    @staticmethod
+    def parse_info(raw: bytes) -> dict[str, str]:
+        """把查询响应解析成「字段 → 取值」。
+
+        TODO: 协议确定后按真实格式实现。默认按 UTF-8 文本解析，支持以换行或
+        分号分隔的 ``键=值`` 形式；若整段没有 ``=``，则原样作为一条响应返回。
+        """
+        text = raw.decode("utf-8", errors="replace").strip()
+        if not text:
+            raise DeviceError("测距仪信息响应为空")
+
+        info: dict[str, str] = {}
+        for chunk in re.split(r"[;\r\n]+", text):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            key, sep, value = chunk.partition("=")
+            if sep:
+                info[key.strip()] = value.strip()
+        return info or {"原始响应": text}
 
     # -- 事件循环管理 ------------------------------------------------------ #
 
@@ -583,7 +763,7 @@ class BleScanner(QThread):
     scan_finished = pyqtSignal(int)
     scan_failed = pyqtSignal(str)
 
-    def __init__(self, timeout: float = 5.0, parent: Any = None) -> None:
+    def __init__(self, timeout: float = 6.0, parent: Any = None) -> None:
         super().__init__(parent)
         self.timeout = float(timeout)
         self._cancelled = threading.Event()
@@ -622,50 +802,3 @@ class BleScanner(QThread):
             count += 1
 
         self.scan_finished.emit(count)
-
-
-# --------------------------------------------------------------------------- #
-# 工厂函数
-# --------------------------------------------------------------------------- #
-
-
-def create_device(
-    mode: str = MODE_AUTO,
-    *,
-    address: str = "",
-    speed_rpm: float = 12.0,
-    sample_interval: float = 0.05,
-    simulate: bool = False,
-) -> BaseDevice:
-    """按配置构造设备实例。
-
-    ``auto`` 模式下优先尝试蓝牙；地址为空或蓝牙初始化失败时回退到
-    :class:`MockDevice`，保证无硬件时界面依然可用。
-
-    :param mode: ``auto`` / ``mock`` / ``ble`` 之一。
-    :param address: 蓝牙设备地址，``mock`` 模式下忽略。
-    :param simulate: 勾选「模拟运行」时为 ``True``：直接返回
-        :class:`SimulatedDevice`，**完全不做真实通信**，``mode`` 与 ``address``
-        仅用于在提示里说明「本来会连哪台设备」。
-    :returns: 设备实例（尚未连接）。
-    """
-    if simulate:
-        target = address.strip() or f"按「{mode}」模式自动选择的设备"
-        return SimulatedDevice(
-            target=target, speed_rpm=speed_rpm, sample_interval=sample_interval
-        )
-
-    if mode == MODE_MOCK:
-        return MockDevice(speed_rpm=speed_rpm, sample_interval=sample_interval)
-
-    if mode == MODE_BLE:
-        # 显式选择蓝牙时不再回退，让错误直接暴露给用户
-        return BleDevice(address, speed_rpm=speed_rpm, sample_interval=sample_interval)
-
-    # auto
-    if address.strip():
-        try:
-            return BleDevice(address, speed_rpm=speed_rpm, sample_interval=sample_interval)
-        except DeviceError:
-            pass
-    return MockDevice(speed_rpm=speed_rpm, sample_interval=sample_interval)

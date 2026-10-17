@@ -3,18 +3,20 @@
 界面结构::
 
     ┌──────────────────────────────────────────────┐
-    │ [绘制] [导出] [设置]      ← QToolBar（左上角） │
+    │ 连接 │ 绘制 │ 编辑 │ 导出 │ 设置 │ 关于        │ ← 顶部菜单栏
     ├──────────────────────────────────────────────┤
     │                                              │
-    │         GLViewWidget 3D 扫描视图              │
+    │         ScanView 2D 俯视平面图                │
     │                                              │
     ├──────────────────────────────────────────────┤
-    │ 状态提示            [进度条]      交互提示     │
+    │ 状态提示       [进度条]   点数   交互提示      │
     └──────────────────────────────────────────────┘
 
-扫描在 :class:`ScanWorker` 线程中执行，通过信号实时把每个采样点回传主线程绘制，
-因此界面不会卡死。平滑算法（中值滤波 + 滑动均值 + 分段最小二乘直线拟合）也放在
-工作线程内完成，避免大点集阻塞界面。
+采集在 :class:`ScanWorker` 线程中执行，通过信号把每一帧 ``{点序号, 距离}``
+换算出的 ``(角度, 距离)`` 实时回传主线程绘制，因此界面不会卡死。距离→角度的
+换算是 ``角度 = 点序号 / 一圈点数 * 360``，随后生成 2D 俯视坐标并连线。
+
+平滑算法（分段最小二乘直线拟合等）也放在工作线程内完成，避免大点集阻塞界面。
 """
 
 from __future__ import annotations
@@ -22,11 +24,12 @@ from __future__ import annotations
 import logging
 import math
 import sys
+import threading
 from pathlib import Path
 from typing import Sequence
 
 import numpy as np
-from PyQt6.QtCore import QTimer, Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication,
@@ -35,14 +38,20 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressBar,
-    QStyle,
-    QToolBar,
 )
 
-from device import MODE_AUTO, MODE_MOCK, BaseDevice, DeviceError, MockDevice, create_device
-from exporter import FORMAT_PENDING_MESSAGE, export_scan, suggested_filename
-from plot3d import ScanView
-from settings_dialog import ScanConfig, SettingsDialog, load_config
+from device import (
+    DeviceError,
+    BaseDevice,
+    BleDevice,
+    SimulatedDevice,
+    frame_angle_deg,
+)
+from dialogs import AboutDialog, ConnectDialog
+from exporter import export_scan, suggested_filename
+from plot2d import ScanView
+from settings_dialog import ScanConfig, SettingsDialog, load_config, save_config
+from version import APP_TITLE, APP_VERSION
 
 __all__ = ["MainWindow", "ScanWorker", "main"]
 
@@ -64,26 +73,23 @@ def polar_to_points(
     angles_deg: Sequence[float] | np.ndarray,
     distances: Sequence[float] | np.ndarray,
 ) -> np.ndarray:
-    """把极坐标采样转换为 3D 坐标。
+    """把极坐标采样转换为 2D 俯视坐标。
 
-    ``x = d * cos(θ)``，``y = d * sin(θ)``，``z = 0``。
+    ``x = d * cos(θ)``，``y = d * sin(θ)``。
 
     :param angles_deg: 角度序列（度）。
     :param distances: 距离序列（米）。
-    :returns: 形状 ``(N, 3)`` 的坐标数组。
+    :returns: 形状 ``(N, 2)`` 的坐标数组。
     """
     angle_arr = np.asarray(angles_deg, dtype=np.float64).ravel()
     dist_arr = np.asarray(distances, dtype=np.float64).ravel()
     if angle_arr.size != dist_arr.size:
         raise ValueError(f"角度与距离长度不一致：{angle_arr.size} != {dist_arr.size}")
     if angle_arr.size == 0:
-        return np.zeros((0, 3), dtype=np.float64)
+        return np.zeros((0, 2), dtype=np.float64)
 
     rad = np.radians(angle_arr)
-    x = dist_arr * np.cos(rad)
-    y = dist_arr * np.sin(rad)
-    z = np.zeros_like(x)
-    return np.column_stack((x, y, z))
+    return np.column_stack((dist_arr * np.cos(rad), dist_arr * np.sin(rad)))
 
 
 # --------------------------------------------------------------------------- #
@@ -380,17 +386,17 @@ def piecewise_line_fit(
     真实的测量点挪走（角度分辨率越低、偏离越大），反而降低几何精度。投影后
     两段直线自然相接，拐角最多只有一个角度步进的圆角。
 
-    :param points: 形状 ``(N, 3)`` 的点集。
+    :param points: 形状 ``(N, 2)`` 的点集。
     :param angle_threshold_deg: 合并相邻段时的方向夹角阈值（度）。
     :param min_segment: 点数少于该值时不拟合，直接原样返回。
     :param residual_tolerance: 分段阈值（米）；``None`` 时由数据自动估计。
     :returns: 拟合后的点集，形状与输入一致；点数不足时原样返回。
     """
     arr = np.asarray(points, dtype=np.float64)
-    if arr.ndim != 2 or arr.shape[1] != 3 or arr.shape[0] < 2 * max(2, min_segment):
+    if arr.ndim != 2 or arr.shape[1] != 2 or arr.shape[0] < 2 * max(2, min_segment):
         return arr.copy()
 
-    xy = arr[:, :2]
+    xy = arr
     segments = _segment_runs(xy, residual_tolerance, angle_threshold_deg)
 
     result = xy.copy()
@@ -405,10 +411,7 @@ def piecewise_line_fit(
         t = (segment - origin) @ direction
         result[start:end] = origin + np.outer(t, direction)
 
-    out = arr.copy()
-    out[:, :2] = result
-    out[:, 2] = 0.0
-    return out
+    return result
 
 
 def _filter_runs(
@@ -509,26 +512,26 @@ def smooth_scan(
        严重）。理由详见 :func:`_mean_filter_xy`。
     4. 重新分段并做总体最小二乘直线拟合，段内点投影到拟合直线上，墙面被拉直。
 
-    :returns: 形状 ``(N, 3)`` 的平滑后点集。
+    :returns: 形状 ``(N, 2)`` 的平滑后点集。
     """
     angle_arr = np.asarray(angles_deg, dtype=np.float64).ravel()
     dist_arr = np.asarray(distances, dtype=np.float64).ravel()
     if dist_arr.size == 0:
-        return np.zeros((0, 3), dtype=np.float64)
+        return np.zeros((0, 2), dtype=np.float64)
 
     # 由原始距离序列估计噪声，作为分段阈值
     sigma = _estimate_distance_noise(dist_arr)
     tolerance = float(np.clip(2.5 * sigma, 0.015, 0.30)) if sigma > 0 else None
 
     raw_points = polar_to_points(angle_arr, dist_arr)
-    segments = _segment_runs(raw_points[:, :2], tolerance, corner_threshold_deg)
+    segments = _segment_runs(raw_points, tolerance, corner_threshold_deg)
 
     # 段内滤波：窗口被限制在同一面墙内，且不触碰段端点。
     # 中值在距离空间（离群点是径向尖刺），均值在 xy 空间（墙在那里才是直线）。
     filtered = _filter_runs(dist_arr, segments, median_window)
 
     points = polar_to_points(angle_arr, filtered)
-    points[:, :2] = _mean_filter_xy(points[:, :2], segments, mean_window)
+    points = _mean_filter_xy(points, segments, mean_window)
 
     return piecewise_line_fit(
         points,
@@ -551,19 +554,22 @@ def _estimate_distance_noise(distances: np.ndarray) -> float:
 
 
 # --------------------------------------------------------------------------- #
-# 扫描线程
+# 采集线程
 # --------------------------------------------------------------------------- #
 
 
 class ScanWorker(QThread):
-    """在后台线程执行一次完整扫描。
+    """在后台线程执行一次整圈采集。
+
+    每收到一帧 ``{点序号, 距离}``，按 ``角度 = 点序号 / 一圈点数 * 360`` 换算后
+    发出 :attr:`sample_ready`。
 
     信号：
         * ``progress(int)``              —— 进度百分比 0~100。
         * ``sample_ready(float, float)`` —— 单个采样点（角度°, 距离 m）。
         * ``finished_ok(object, object, str)`` —— 原始点集、平滑点集（未开启平滑
           时为 ``None``）、设备名称。
-        * ``failed(str)``                —— 扫描失败原因。
+        * ``failed(str)``                —— 采集失败原因。
     """
 
     progress = pyqtSignal(int)
@@ -571,107 +577,103 @@ class ScanWorker(QThread):
     finished_ok = pyqtSignal(object, object, str)
     failed = pyqtSignal(str)
 
-    def __init__(self, config: ScanConfig, parent: QThread | None = None) -> None:
+    def __init__(
+        self,
+        device: BaseDevice,
+        points_per_turn: int,
+        *,
+        smooth: bool = True,
+        parent: QThread | None = None,
+    ) -> None:
         super().__init__(parent)
-        self.config = config
+        self.device = device
+        self.points_per_turn = max(1, int(points_per_turn))
+        self.smooth = bool(smooth)
+
         self._cancelled = False
+        #: 置位 = 正在接收；清除 = 暂停接收
+        self._receiving = threading.Event()
+        self._receiving.set()
+
+    # -- 控制 -------------------------------------------------------------- #
+
+    def pause(self) -> None:
+        """暂停接收：不再从设备取帧，但保持连接。"""
+        self._receiving.clear()
+
+    def resume(self) -> None:
+        """恢复接收。"""
+        self._receiving.set()
 
     def cancel(self) -> None:
-        """请求停止扫描；已采集的数据仍会正常返回。"""
+        """请求停止采集；已采集的数据仍会正常返回。"""
         self._cancelled = True
+        self._receiving.set()  # 暂停中也能退出
 
     # -- 入口 -------------------------------------------------------------- #
 
     def run(self) -> None:  # noqa: D102 - QThread 入口
-        config = self.config
-        device: BaseDevice | None = None
-        fallback_note = ""
-
         try:
-            device = create_device(
-                config.mode,
-                address=config.address,
-                speed_rpm=config.speed_rpm,
-                sample_interval=config.sample_interval,
-                simulate=config.simulate,
-            )
-            try:
-                device.connect()
-            except DeviceError as exc:
-                if config.mode != MODE_AUTO:
-                    raise
-                # 自动模式：蓝牙不可用时回退到模拟设备，保证界面可用
-                logger.warning("蓝牙设备不可用，回退到模拟设备：%s", exc)
-                brief = str(exc).strip().splitlines()[0][:40]
-                fallback_note = f"（蓝牙不可用，已回退模拟：{brief}）"
-                device = MockDevice(
-                    speed_rpm=config.speed_rpm, sample_interval=config.sample_interval
-                )
-                device.connect()
+            self.device.start_scan(self.points_per_turn)
         except DeviceError as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(f"启动采集失败：{exc}")
             return
         except Exception as exc:  # noqa: BLE001 - 兜底，避免线程异常导致界面无响应
-            logger.exception("设备初始化失败")
-            self.failed.emit(f"设备初始化失败：{exc}")
+            logger.exception("启动采集失败")
+            self.failed.emit(f"启动采集失败：{exc}")
             return
 
         try:
-            self._scan_loop(device, fallback_note)
+            self._scan_loop()
         finally:
             try:
-                device.disconnect()
-            except Exception:  # noqa: BLE001 - 断开失败不影响结果
-                logger.warning("断开设备时出现异常", exc_info=True)
+                self.device.stop_scan()
+            except Exception:  # noqa: BLE001 - 停止失败不影响结果
+                logger.warning("停止采集时出现异常", exc_info=True)
 
     # -- 主循环 ------------------------------------------------------------ #
 
-    def _scan_loop(self, device: BaseDevice, fallback_note: str) -> None:
-        config = self.config
-        total_angle = 360.0 * max(1, int(config.turns))
-        step = max(0.1, config.degrees_per_sample())
-        count = max(2, int(round(total_angle / step)))
-        angles = np.linspace(0.0, total_angle, count, endpoint=False)
-
-        angles_done: list[float] = []
+    def _scan_loop(self) -> None:
+        total = self.points_per_turn
+        angles: list[float] = []
         distances: list[float] = []
 
-        for index, angle in enumerate(angles):
+        for count in range(total):
+            self._receiving.wait()  # 暂停时停在这里
             if self._cancelled:
-                logger.info("扫描被用户取消，已完成 %d 个采样点", len(distances))
+                logger.info("采集被用户停止，已收到 %d 帧", len(distances))
                 break
+
             try:
-                device.rotate_to(float(angle))
-                distance = float(device.read_distance())
+                frame = self.device.read_frame()
             except DeviceError as exc:
-                self.failed.emit(f"扫描中断：{exc}")
+                self.failed.emit(f"接收中断：{exc}")
                 return
-            except Exception as exc:  # noqa: BLE001 - 单点异常不应终止整个扫描
-                logger.warning("第 %d 个采样点读取失败：%s", index, exc)
+            except Exception as exc:  # noqa: BLE001 - 单帧异常不应终止整圈
+                logger.warning("第 %d 帧读取失败：%s", count, exc)
                 continue
 
-            angles_done.append(float(angle))
-            distances.append(distance)
-            self.sample_ready.emit(float(angle), distance)
-            self.progress.emit(int((index + 1) * 100 / count))
+            angle = frame_angle_deg(frame.index, total)
+            angles.append(angle)
+            distances.append(float(frame.distance))
+            self.sample_ready.emit(angle, float(frame.distance))
+            self.progress.emit(int((count + 1) * 100 / total))
 
         if not distances:
             self.failed.emit("未采集到任何数据，请检查设备连接。")
             return
 
         try:
-            raw_points = polar_to_points(angles_done, distances)
-            smooth_points = (
-                smooth_scan(angles_done, distances) if config.smooth else None
-            )
+            raw_points = polar_to_points(angles, distances)
+            smooth_points = smooth_scan(angles, distances) if self.smooth else None
         except Exception as exc:  # noqa: BLE001 - 平滑失败时退化为原始点
-            logger.exception("平滑处理失败，改用手工原始点")
-            raw_points = polar_to_points(angles_done, distances)
+            logger.exception("平滑处理失败，改用原始点")
+            raw_points = polar_to_points(angles, distances)
             smooth_points = None
             self.failed.emit(f"平滑处理失败，已显示原始点：{exc}")
 
         self.progress.emit(100)
-        self.finished_ok.emit(raw_points, smooth_points, f"{device.name}{fallback_note}")
+        self.finished_ok.emit(raw_points, smooth_points, self.device.name)
 
 
 # --------------------------------------------------------------------------- #
@@ -680,81 +682,133 @@ class ScanWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    """应用主窗口：工具栏 + 3D 视图 + 状态栏。"""
+    """应用主窗口：菜单栏 + 2D 俯视视图 + 状态栏。"""
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("环境测量 · 3D 扫描")
+        self.setWindowTitle(f"{APP_TITLE} {APP_VERSION}")
         self.resize(1080, 720)
 
         self.config: ScanConfig = load_config()
 
-        # -- 中央 3D 视图 -------------------------------------------------- #
-        self.view = ScanView(self)
+        # -- 中央 2D 视图 -------------------------------------------------- #
+        self.view = ScanView(self)  # 「点距」默认关闭
         self.setCentralWidget(self.view)
 
-        # -- 扫描状态 ------------------------------------------------------ #
+        # -- 设备与采集状态 ------------------------------------------------ #
+        self._device: BleDevice | None = None  # 已连接的蓝牙测距仪
         self._worker: ScanWorker | None = None
-        self._pending_angles: list[float] = []
-        self._pending_distances: list[float] = []
-        self._points: np.ndarray = np.zeros((0, 3), dtype=np.float64)
+        self._angles: list[float] = []
+        self._distances: list[float] = []
+        self._points: np.ndarray = np.zeros((0, 2), dtype=np.float64)
+        self._discard: bool = False  # 复位后丢弃线程回传的结果
+        self._paused: bool = False
 
-        # 定时刷新预览，避免每个采样点都重建图元
+        # 定时刷新预览，避免每帧都重建图元
         self._preview_timer = QTimer(self)
         self._preview_timer.setInterval(PREVIEW_INTERVAL_MS)
         self._preview_timer.timeout.connect(self._flush_preview)
 
-        self._build_toolbar()
+        self._build_menus()
         self._build_statusbar()
+        self._update_actions()
         self._apply_config_to_status()
 
     # ------------------------------------------------------------------ #
     # 界面构建
     # ------------------------------------------------------------------ #
 
-    def _build_toolbar(self) -> None:
-        """构建左上角工具栏：绘制 / 导出 / 设置。"""
-        style = self.style()
+    def _build_menus(self) -> None:
+        """构建顶部菜单栏：连接 | 绘制 | 编辑 | 导出 | 设置 | 关于。"""
+        bar = self.menuBar()
 
-        toolbar = QToolBar("主工具栏", self)
-        toolbar.setMovable(False)
-        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, toolbar)
+        # -- 连接 ---------------------------------------------------------- #
+        self.action_connect = QAction("连接蓝牙测距仪…", self)
+        self.action_connect.setShortcut(QKeySequence("Ctrl+K"))
+        self.action_connect.setStatusTip("扫描附近的蓝牙测距仪并建立连接")
+        self.action_connect.triggered.connect(self._on_connect)
 
-        self.action_draw = QAction(
-            style.standardIcon(QStyle.StandardPixmap.SP_MediaPlay), "绘制", self
-        )
-        self.action_draw.setShortcut(QKeySequence("F5"))
-        self.action_draw.setToolTip("开始扫描并绘制 3D 空间平面图（F5）")
-        self.action_draw.triggered.connect(self._toggle_scan)
+        self.action_disconnect = QAction("断开连接", self)
+        self.action_disconnect.setStatusTip("断开当前蓝牙测距仪")
+        self.action_disconnect.triggered.connect(self._on_disconnect)
 
-        self.action_export = QAction(
-            style.standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton), "导出", self
-        )
+        connect_menu = bar.addMenu("连接")
+        connect_menu.addAction(self.action_connect)
+        connect_menu.addAction(self.action_disconnect)
+
+        # -- 绘制 ---------------------------------------------------------- #
+        self.action_start = QAction("开始", self)
+        self.action_start.setShortcut(QKeySequence("F5"))
+        self.action_start.setStatusTip("开始采集（暂停后为「继续」）")
+        self.action_start.triggered.connect(self._on_start)
+
+        self.action_pause = QAction("暂停", self)
+        self.action_pause.setShortcut(QKeySequence("F6"))
+        self.action_pause.setStatusTip("暂停接收")
+        self.action_pause.triggered.connect(self._on_pause)
+
+        self.action_reset = QAction("复位", self)
+        self.action_reset.setShortcut(QKeySequence("F7"))
+        self.action_reset.setStatusTip("清空图形与点位")
+        self.action_reset.triggered.connect(self._on_reset)
+
+        draw_menu = bar.addMenu("绘制")
+        draw_menu.addAction(self.action_start)
+        draw_menu.addAction(self.action_pause)
+        draw_menu.addAction(self.action_reset)
+
+        # -- 编辑 ---------------------------------------------------------- #
+        self.action_smooth = QAction("平滑", self)
+        self.action_smooth.setCheckable(True)
+        self.action_smooth.setChecked(self.config.smooth)
+        self.action_smooth.setStatusTip("把折线边拉直（分段最小二乘直线拟合）")
+        self.action_smooth.toggled.connect(self._on_toggle_smooth)
+
+        self.action_labels = QAction("点距", self)
+        self.action_labels.setCheckable(True)
+        self.action_labels.setStatusTip("显示每个点到测距仪中心的距离")
+        self.action_labels.toggled.connect(self._on_toggle_labels)
+
+        edit_menu = bar.addMenu("编辑")
+        edit_menu.addAction(self.action_smooth)
+        edit_menu.addAction(self.action_labels)
+
+        # -- 导出 ---------------------------------------------------------- #
+        self.action_export = QAction("导出 DXF…", self)
         self.action_export.setShortcut(QKeySequence("Ctrl+E"))
-        self.action_export.setToolTip("导出当前扫描结果（Ctrl+E）")
+        self.action_export.setStatusTip("导出当前 2D 图形为 DXF，供 CAD 使用")
         self.action_export.triggered.connect(self._on_export)
 
-        self.action_settings = QAction(
-            style.standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView), "设置", self
-        )
+        export_menu = bar.addMenu("导出")
+        export_menu.addAction(self.action_export)
+
+        # -- 设置 ---------------------------------------------------------- #
+        self.action_settings = QAction("设置…", self)
         self.action_settings.setShortcut(QKeySequence("Ctrl+,"))
-        self.action_settings.setToolTip("蓝牙与扫描参数设置（Ctrl+,）")
+        self.action_settings.setStatusTip("运行方式与采集参数")
         self.action_settings.triggered.connect(self._on_settings)
 
-        for action in (self.action_draw, self.action_export, self.action_settings):
-            toolbar.addAction(action)
+        settings_menu = bar.addMenu("设置")
+        settings_menu.addAction(self.action_settings)
 
-        # 复位视角不占用工具栏按钮，仅提供快捷键
+        # -- 关于 ---------------------------------------------------------- #
+        self.action_about = QAction("关于…", self)
+        self.action_about.setStatusTip("软件版本与测距仪信息")
+        self.action_about.triggered.connect(self._on_about)
+
+        about_menu = bar.addMenu("关于")
+        about_menu.addAction(self.action_about)
+
+        # 复位视角不占菜单位置，仅提供快捷键
         self.action_reset_view = QAction("复位视角", self)
         self.action_reset_view.setShortcut(QKeySequence("Ctrl+R"))
-        self.action_reset_view.triggered.connect(self._on_reset_view)
+        self.action_reset_view.triggered.connect(
+            lambda: self.view.reset_view(self._points if self._points.shape[0] else None)
+        )
         self.addAction(self.action_reset_view)
 
-        self._toolbar = toolbar
-
     def _build_statusbar(self) -> None:
-        """构建状态栏：提示文本 + 进度条 + 操作说明。"""
+        """构建状态栏：提示文本 + 进度条 + 点数 + 操作说明。"""
         bar = self.statusBar()
 
         self.status_label = QLabel("就绪", self)
@@ -771,48 +825,153 @@ class MainWindow(QMainWindow):
         self.count_label = QLabel("点数：0", self)
         bar.addPermanentWidget(self.count_label)
 
-        hint = QLabel("左键拖动旋转 · 滚轮缩放 · 中键平移 · Ctrl+R 复位", self)
+        hint = QLabel("滚轮缩放 · 左键拖动平移 · 双击复位", self)
         hint.setEnabled(False)
         bar.addPermanentWidget(hint)
 
     def _apply_config_to_status(self) -> None:
         """把当前配置摘要显示在状态栏。"""
         cfg = self.config
-        if cfg.simulate:
-            mode_text = "模拟运行（不通信）"
-        else:
-            mode_text = {
-                MODE_AUTO: "自动",
-                MODE_MOCK: "模拟设备",
-                "ble": "蓝牙设备",
-            }.get(cfg.mode, cfg.mode)
+        mode_text = "模拟运行（不通信）" if cfg.simulate else self._device_text()
         self.status_label.setText(
-            f"就绪 · {mode_text} · {cfg.turns} 圈 · "
-            f"平滑{'开' if cfg.smooth else '关'} · {cfg.speed_rpm:.1f} RPM"
+            f"就绪 · {mode_text} · 一圈 {cfg.points_per_turn} 点 "
+            f"（{cfg.degrees_per_point():.4g}°/点）"
         )
+
+    def _device_text(self) -> str:
+        """当前蓝牙设备描述。"""
+        if self._device is not None and self._device.connected:
+            return self._device.name
+        return "未连接蓝牙测距仪"
+
+    def _update_actions(self) -> None:
+        """按采集状态刷新菜单项的可用性与文案。"""
+        running = self._worker is not None and self._worker.isRunning()
+        paused = running and self._paused
+
+        self.action_start.setText("继续" if paused else "开始")
+        self.action_start.setEnabled(not running or paused)
+        self.action_pause.setEnabled(running and not paused)
+        self.action_reset.setEnabled(running or self._points.shape[0] > 0)
+        self.action_export.setEnabled(self._points.shape[0] > 0)
+        self.action_settings.setEnabled(not running)
+        self.action_connect.setEnabled(not running)
+        self.action_disconnect.setEnabled(self._device is not None and not running)
+
+    # ------------------------------------------------------------------ #
+    # 「连接」
+    # ------------------------------------------------------------------ #
+
+    def _on_connect(self) -> None:
+        """扫描并连接蓝牙测距仪。"""
+        dialog = ConnectDialog(self, simulate=self.config.simulate)
+        if dialog.exec() != ConnectDialog.DialogCode.Accepted:
+            self._update_actions()
+            return
+
+        device = dialog.device()
+        if device is None:
+            return
+
+        if self._device is not None:
+            self._disconnect_device()
+        self._device = device
+
+        self.config.address = device.address
+        try:
+            save_config(self.config)
+        except Exception:  # noqa: BLE001 - 地址保存失败不影响连接
+            logger.warning("保存设备地址失败", exc_info=True)
+
+        self.status_label.setText(f"已连接：{device.name}")
+        self._update_actions()
+
+    def _on_disconnect(self) -> None:
+        self._disconnect_device()
+        self.status_label.setText("已断开蓝牙测距仪")
+        self._update_actions()
+
+    def _disconnect_device(self) -> None:
+        if self._device is None:
+            return
+        try:
+            self._device.disconnect()
+        except Exception:  # noqa: BLE001 - 断开失败不影响退出
+            logger.warning("断开蓝牙设备时出现异常", exc_info=True)
+        self._device = None
 
     # ------------------------------------------------------------------ #
     # 「绘制」
     # ------------------------------------------------------------------ #
 
-    def _toggle_scan(self) -> None:
-        """点击「绘制」开始扫描；扫描中再次点击则停止。"""
+    def _on_start(self) -> None:
+        """开始采集；暂停中则继续。"""
         if self._worker is not None and self._worker.isRunning():
-            self._worker.cancel()
-            self.status_label.setText("正在停止扫描…")
-            self.action_draw.setEnabled(False)
+            if self._paused:
+                self._paused = False
+                self._worker.resume()
+                self.status_label.setText("采集中…")
+                self._update_actions()
             return
         self._start_scan()
 
-    def _start_scan(self) -> None:
-        """清空视图并启动扫描线程。"""
+    def _on_pause(self) -> None:
+        """暂停接收。"""
+        if self._worker is None or not self._worker.isRunning() or self._paused:
+            return
+        self._paused = True
+        self._worker.pause()
+        self.status_label.setText(f"已暂停接收 · 已收到 {len(self._distances)} 帧")
+        self._update_actions()
+
+    def _on_reset(self) -> None:
+        """复位：停止采集并清空图形与点位。
+
+        ``_discard`` 保持为 ``True``，直到下一次「开始」才清掉：线程被取消后仍会
+        把已经采到的部分数据回传，若不屏蔽，复位后的图形会被这些数据重新画上。
+        """
+        self._discard = True
+        self._preview_timer.stop()
+
+        worker = self._worker
+        if worker is not None:
+            if worker.isRunning():
+                worker.cancel()
+                worker.wait(3000)  # 超时也不强求，finished 信号随后会收尾
+            if not worker.isRunning():
+                self._worker = None
+
+        self._paused = False
+        self._angles.clear()
+        self._distances.clear()
+        self._points = np.zeros((0, 2), dtype=np.float64)
         self.view.clear_scan()
-        self._points = np.zeros((0, 3), dtype=np.float64)
-        self._pending_angles.clear()
-        self._pending_distances.clear()
+
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+        self._update_count_label()
+        self.status_label.setText("已复位")
+        self._apply_config_to_status()
+        self._update_actions()
+
+    def _start_scan(self) -> None:
+        """清空视图并启动采集线程。"""
+        device = self._acquire_device()
+        if device is None:
+            return
+
+        self._discard = False
+        self._paused = False
+        self._angles.clear()
+        self._distances.clear()
+        self._points = np.zeros((0, 2), dtype=np.float64)
+        self.view.clear_scan()
+        self.view.reset_view()
         self._update_count_label()
 
-        worker = ScanWorker(self.config, self)
+        worker = ScanWorker(
+            device, self.config.points_per_turn, smooth=self.action_smooth.isChecked(), parent=self
+        )
         worker.sample_ready.connect(self._on_sample)
         worker.progress.connect(self._on_progress)
         worker.finished_ok.connect(self._on_finished)
@@ -822,50 +981,76 @@ class MainWindow(QMainWindow):
 
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
-        self.action_draw.setText("停止")
-        self.action_draw.setIcon(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaStop)
-        )
-        self.action_draw.setToolTip("停止当前扫描")
-        self.action_export.setEnabled(False)
-        self.status_label.setText("扫描中…")
+        self.status_label.setText(f"采集中…（一圈 {self.config.points_per_turn} 个点）")
 
         self._preview_timer.start()
         worker.start()
+        self._update_actions()
+
+    def _acquire_device(self) -> BaseDevice | None:
+        """取得本次采集要用的设备。"""
+        if self.config.simulate:
+            # 模拟运行：每次采集用一个全新的模拟设备，完全不碰蓝牙
+            device = SimulatedDevice()
+            device.connect()
+            return device
+
+        if self._device is not None and self._device.connected:
+            return self._device
+
+        if self._device is not None:  # 连接已失效
+            self._disconnect_device()
+        self.status_label.setText("未连接蓝牙测距仪")
+        QMessageBox.warning(
+            self,
+            "绘制",
+            "尚未连接蓝牙测距仪。\n\n"
+            "请先点击「连接」菜单扫描并连接测距仪；\n"
+            "或在「设置」中勾选「模拟运行」后离线演示。",
+        )
+        return None
 
     def _on_sample(self, angle: float, distance: float) -> None:
-        """接收单个采样点（主线程槽函数）。"""
-        self._pending_angles.append(angle)
-        self._pending_distances.append(distance)
+        """接收单个采样点（主线程槽函数）。
+
+        暂停时直接丢弃：暂停的瞬间可能还有一帧已经发出、正排在主线程的事件队列
+        里，若照收会让「暂停」看上去漏了一拍。
+        """
+        if self._paused:
+            return
+        self._angles.append(angle)
+        self._distances.append(distance)
 
     def _flush_preview(self) -> None:
-        """把缓存中的采样点绘制到 3D 视图。"""
-        if not self._pending_distances:
+        """把缓存中的采样点绘制到 2D 视图。"""
+        if not self._distances or self._discard:
             return
         try:
-            distances = np.asarray(self._pending_distances, dtype=np.float64)
-            if self.config.smooth:
+            distances = np.asarray(self._distances, dtype=np.float64)
+            if self.action_smooth.isChecked():
                 distances = causal_smooth(distances, window=5)
-            points = polar_to_points(self._pending_angles, distances)
+            points = polar_to_points(self._angles, distances)
             self.view.set_scan(points)
             self._points = points
             self._update_count_label()
-        except Exception:  # noqa: BLE001 - 预览异常不应中断扫描
+        except Exception:  # noqa: BLE001 - 预览异常不应中断采集
             logger.exception("实时预览刷新失败")
 
     def _on_progress(self, value: int) -> None:
         self.progress_bar.setValue(int(value))
 
     def _on_finished(self, raw_points: object, smooth_points: object, device_name: str) -> None:
-        """扫描完成：保留最终图形。"""
+        """采集完成：保留最终图形。"""
         self._preview_timer.stop()
-        self._flush_preview()
+        if self._discard:
+            return
 
         points = smooth_points if smooth_points is not None else raw_points
         try:
-            self.view.set_scan(points)
-            self.view.reset_view(points)  # 按数据范围自动取景
-            self._points = np.asarray(points, dtype=np.float64)
+            arr = np.asarray(points, dtype=np.float64)
+            self.view.set_scan(arr)
+            self.view.reset_view(arr)  # 按数据范围自动取景
+            self._points = arr
         except Exception as exc:  # noqa: BLE001
             logger.exception("绘制最终结果失败")
             self.status_label.setText(f"绘制失败：{exc}")
@@ -874,83 +1059,139 @@ class MainWindow(QMainWindow):
         self._update_count_label()
         smooth_text = "已平滑" if smooth_points is not None else "未平滑"
         self.status_label.setText(
-            f"扫描完成 · {device_name} · {self._points.shape[0]} 点 · {smooth_text}"
+            f"采集完成 · {device_name} · {self._points.shape[0]} 点 · {smooth_text}"
         )
+        self._update_actions()
 
     def _on_failed(self, message: str) -> None:
-        self.status_label.setText(f"扫描失败：{message}")
-        logger.error("扫描失败：%s", message)
-        QMessageBox.warning(self, "扫描失败", message)
+        if self._discard:
+            return
+        self.status_label.setText(f"采集失败：{message}")
+        logger.error("采集失败：%s", message)
+        QMessageBox.warning(self, "采集失败", message)
 
     def _on_worker_stopped(self) -> None:
         """线程结束后的界面复位。"""
         self._preview_timer.stop()
         self.progress_bar.setVisible(False)
-        self.action_draw.setText("绘制")
-        self.action_draw.setIcon(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
-        )
-        self.action_draw.setToolTip("开始扫描并绘制 3D 空间平面图（F5）")
-        self.action_draw.setEnabled(True)
-        self.action_export.setEnabled(self._points.shape[0] > 0)
         self._worker = None
+        self._paused = False
+        self._update_actions()
+
+    # ------------------------------------------------------------------ #
+    # 「编辑」
+    # ------------------------------------------------------------------ #
+
+    def _on_toggle_smooth(self, checked: bool) -> None:
+        """平滑开关：把当前折线重新拉直 / 还原为原始点。"""
+        self.config.smooth = bool(checked)
+        try:
+            save_config(self.config)
+        except Exception:  # noqa: BLE001 - 保存失败不影响本次操作
+            logger.warning("保存平滑开关失败", exc_info=True)
+        self._render()
+
+    def _on_toggle_labels(self, checked: bool) -> None:
+        """点距开关：显示 / 隐藏每个点到测距仪中心的距离。"""
+        self.view.set_show_labels(bool(checked))
+
+    def _render(self) -> None:
+        """按当前「平滑」开关重新计算并显示图形。"""
+        if not self._distances:
+            return
+        try:
+            points = (
+                smooth_scan(self._angles, self._distances)
+                if self.action_smooth.isChecked()
+                else polar_to_points(self._angles, self._distances)
+            )
+        except Exception as exc:  # noqa: BLE001 - 平滑失败时退回原始点
+            logger.exception("平滑处理失败")
+            self.status_label.setText(f"平滑失败，已显示原始点：{exc}")
+            points = polar_to_points(self._angles, self._distances)
+
+        self._points = np.asarray(points, dtype=np.float64)
+        self.view.set_scan(self._points)
+        self._update_count_label()
+        self.status_label.setText(
+            f"{'已平滑' if self.action_smooth.isChecked() else '未平滑'} · "
+            f"{self._points.shape[0]} 点"
+        )
+        self._update_actions()
 
     # ------------------------------------------------------------------ #
     # 「导出」
     # ------------------------------------------------------------------ #
 
     def _on_export(self) -> None:
-        """弹出保存对话框，调用 :func:`exporter.export_scan`。"""
-        if self._points.shape[0] == 0:
-            QMessageBox.information(self, "导出", "当前没有扫描数据，请先点击「绘制」。")
+        """导出当前 2D 图形为 DXF。"""
+        if self._points.shape[0] < 2:
+            QMessageBox.information(self, "导出", "当前没有可导出的图形，请先「绘制 → 开始」。")
             return
 
         path, _selected = QFileDialog.getSaveFileName(
             self,
-            "导出扫描数据",
-            suggested_filename(),
-            "所有文件 (*)",
+            "导出 DXF",
+            suggested_filename("dxf"),
+            "DXF 图形交换文件 (*.dxf);;所有文件 (*)",
         )
         if not path:
             return
+        if not path.lower().endswith(".dxf"):
+            path += ".dxf"
 
-        result = export_scan(self._points, path, fmt=None)
+        result = export_scan(self._points, path, fmt="dxf")
         self.status_label.setText(result.message.splitlines()[0])
-
-        # 格式未定时只做提示（information），不作为错误处理
-        if result.ok or FORMAT_PENDING_MESSAGE in result.message:
+        if result.ok:
             QMessageBox.information(self, "导出", result.message)
         else:
             QMessageBox.warning(self, "导出", result.message)
 
     # ------------------------------------------------------------------ #
-    # 「设置」
+    # 「设置」/「关于」
     # ------------------------------------------------------------------ #
 
     def _on_settings(self) -> None:
-        """打开设置对话框，确定后保存并应用到后续扫描。"""
+        """打开设置对话框，确定后保存并应用到后续采集。"""
         dialog = SettingsDialog(self.config, self)
         if dialog.exec() == SettingsDialog.DialogCode.Accepted:
             self.config = dialog.config()
+            self.action_smooth.setChecked(self.config.smooth)
             self._apply_config_to_status()
+            self._update_actions()
             logger.info("设置已更新：%s", self.config)
+
+    def _on_about(self) -> None:
+        """显示软件版本与测距仪信息。"""
+        device: BaseDevice | None = self._device
+        temporary: SimulatedDevice | None = None
+        if device is None and self.config.simulate:
+            # 模拟运行：不发送任何蓝牙指令，直接给出模拟设备信息
+            temporary = SimulatedDevice()
+            temporary.connect()
+            temporary.start_scan(self.config.points_per_turn)
+            device = temporary
+
+        AboutDialog(self, device=device, simulate=self.config.simulate).exec()
+
+        if temporary is not None:
+            temporary.disconnect()
 
     # ------------------------------------------------------------------ #
     # 其他
     # ------------------------------------------------------------------ #
 
-    def _on_reset_view(self) -> None:
-        self.view.reset_view(self._points if self._points.shape[0] else None)
-
     def _update_count_label(self) -> None:
         self.count_label.setText(f"点数：{self.view.point_count}")
 
     def closeEvent(self, event: object) -> None:  # noqa: D102 - 覆写 QMainWindow
-        """退出前停止扫描线程，避免残留线程导致崩溃。"""
+        """退出前停止采集线程并断开设备，避免残留线程导致崩溃。"""
+        self._discard = True
         if self._worker is not None and self._worker.isRunning():
             self._worker.cancel()
             self._worker.wait(3000)
         self._preview_timer.stop()
+        self._disconnect_device()
         super().closeEvent(event)  # type: ignore[arg-type]
 
 
@@ -959,59 +1200,24 @@ class MainWindow(QMainWindow):
 # --------------------------------------------------------------------------- #
 
 
-#: 这些 Qt 平台插件无法承载 QOpenGLWidget，截图/显示窗口必然失败
-_HEADLESS_PLATFORMS = {"offscreen", "minimal", "vnc"}
-
-
-def _gl_available() -> bool:
-    """粗略判断当前平台能否真正显示 OpenGL 窗口。
-
-    只识别无头平台插件——它们一定会失败且能安全判断。反过来说，本函数返回
-    ``True`` **并不保证** GL 可用：GLX 配置损坏时，Qt 会在 C++ 层直接 abort，
-    Python 无法拦截（这也是本函数不真的去创建 GL 上下文的原因）。
-    """
-    app = QApplication.instance()
-    return app is None or app.platformName() not in _HEADLESS_PLATFORMS
-
-
 def _save_screenshot(window: MainWindow, path: str) -> bool:
-    """抓取 3D 视图与整个窗口并保存为图片，成功返回 ``True``。
-
-    ``grabFramebuffer()`` 只在 GL 上下文可用时有效；本机等没有 OpenGL 的环境下
-    窗口根本无法 ``show()``，因此这里的失败是环境问题而非绘制问题。
-    """
+    """抓取整个窗口（含菜单栏、平面图、状态栏）并保存为图片。"""
     target = Path(path).expanduser()
     if target.suffix.lower() not in {".png", ".jpg", ".jpeg", ".bmp"}:
         target = target.with_suffix(".png")
 
-    saved: list[Path] = []
-
-    # 1) 3D 视图的帧缓冲——最能说明渲染是否正常
-    try:
-        image = window.view.grabFramebuffer()
-    except Exception as exc:  # noqa: BLE001 - 抓帧失败不应让进程崩溃
-        print(f"[selftest] 抓取帧缓冲失败：{exc}")
-        image = None
-    if image is not None and not image.isNull():
-        view_path = target.with_name(f"{target.stem}_3d{target.suffix}")
-        if image.save(str(view_path)):
-            saved.append(view_path)
-            print(f"[selftest] 3D 视图截图：{view_path}  ({image.width()}x{image.height()})")
-        else:
-            print(f"[selftest] 3D 视图截图写入失败：{view_path}")
-    else:
-        print("[selftest] 3D 视图帧缓冲为空——通常是没有可用的 OpenGL 环境。")
-
-    # 2) 整个窗口（工具栏 + 状态栏 + 3D 视图）
     try:
         pixmap = window.grab()
-        if not pixmap.isNull() and pixmap.save(str(target)):
-            saved.append(target)
-            print(f"[selftest] 窗口截图：{target}  ({pixmap.width()}x{pixmap.height()})")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 - 抓图失败不应让进程崩溃
         print(f"[selftest] 抓取窗口失败：{exc}")
+        return False
 
-    return bool(saved)
+    if pixmap.isNull() or not pixmap.save(str(target)):
+        print(f"[selftest] 窗口截图写入失败：{target}")
+        return False
+
+    print(f"[selftest] 窗口截图：{target}  ({pixmap.width()}x{pixmap.height()})")
+    return True
 
 
 def _run_selftest(
@@ -1019,12 +1225,9 @@ def _run_selftest(
     timeout_ms: int = 60000,
     screenshot: str | None = None,
 ) -> int:
-    """无人值守自检：用「模拟运行」跑一次扫描，完成后自动退出。
+    """无人值守自检：用「模拟运行」跑一次采集，完成后自动退出。
 
     仅用于开发期验证线程、信号与绘制链路是否正常；全程不进行真实蓝牙通信。
-
-    传入 ``screenshot`` 时会先 ``show()`` 窗口，扫描结束后把 3D 视图与整个窗口
-    各存一张图片，便于在支持 OpenGL 的机器上确认渲染效果。
     """
     app = QApplication.instance()
     result = {"code": 1}
@@ -1034,8 +1237,8 @@ def _run_selftest(
             app.quit()
 
     def _capture() -> None:
-        if screenshot and _save_screenshot(window, screenshot):
-            result["shot"] = 0
+        if screenshot:
+            _save_screenshot(window, screenshot)
         _finish()
 
     def _on_finished(raw: object, smooth: object, name: str) -> None:
@@ -1049,13 +1252,11 @@ def _run_selftest(
             print(
                 "[selftest] 坐标范围："
                 f"x [{points[:, 0].min():.2f}, {points[:, 0].max():.2f}] "
-                f"y [{points[:, 1].min():.2f}, {points[:, 1].max():.2f}] "
-                f"z [{points[:, 2].min():.2f}, {points[:, 2].max():.2f}]"
+                f"y [{points[:, 1].min():.2f}, {points[:, 1].max():.2f}]"
             )
             result["code"] = 0
         if screenshot:
-            # 留出时间让 GL 视图用最终数据重绘一次，再抓帧
-            QTimer.singleShot(800, _capture)
+            QTimer.singleShot(800, _capture)  # 留出重绘时间再抓图
         else:
             _finish()
 
@@ -1063,17 +1264,11 @@ def _run_selftest(
         window._start_scan()
         if window._worker is not None:
             window._worker.finished_ok.connect(_on_finished)
-            window._worker.failed.connect(lambda msg: (print(f"[selftest] 扫描失败：{msg}"), _finish()))
+            window._worker.failed.connect(
+                lambda msg: (print(f"[selftest] 采集失败：{msg}"), _finish())
+            )
 
     if screenshot:
-        if not _gl_available():
-            app_name = QApplication.instance().platformName() if app else "?"
-            print(
-                f"[selftest] 当前平台插件「{app_name}」无法显示 OpenGL 窗口，跳过截图。\n"
-                "[selftest] 请在支持 OpenGL 的图形环境下重新运行：\n"
-                f"[selftest]     python main.py --screenshot {screenshot}"
-            )
-            return 1
         window.show()
 
     QTimer.singleShot(300, _start)
@@ -1086,9 +1281,8 @@ def main(argv: list[str] | None = None) -> int:
 
     支持以下参数：
 
-    * ``--selftest``：以「模拟运行」自动跑一次扫描后退出，便于验证环境。
-    * ``--screenshot PATH``：配合 ``--selftest``，显示窗口并把 3D 视图与整个窗口
-      截图保存到 ``PATH``（另存一张 ``*_3d.png``），用于确认渲染效果。
+    * ``--selftest``：以「模拟运行」自动跑一次采集后退出，便于验证环境。
+    * ``--screenshot PATH``：配合 ``--selftest``，显示窗口并截图保存到 ``PATH``。
     * ``--debug``：输出调试日志。
     """
     args = list(sys.argv if argv is None else argv)
@@ -1102,7 +1296,7 @@ def main(argv: list[str] | None = None) -> int:
                 screenshot = args[index + 1]
             else:
                 screenshot = "screenshot.png"
-            selftest = True  # 截图必然伴随一次自检扫描
+            selftest = True  # 截图必然伴随一次自检采集
             break
 
     logging.basicConfig(
@@ -1117,9 +1311,8 @@ def main(argv: list[str] | None = None) -> int:
     window = MainWindow()
 
     if selftest:
-        # 自检使用「模拟运行」+ 较快的参数：不碰任何真实设备，缩短等待时间
-        window.config = ScanConfig(mode=MODE_MOCK, turns=1, smooth=True, speed_rpm=60.0,
-                                   sample_interval=0.02, simulate=True)
+        # 自检使用「模拟运行」+ 较少的点数：不碰任何真实设备，缩短等待时间
+        window.config = ScanConfig(simulate=True, points_per_turn=360, smooth=True)
         logger.info("自检模式（模拟运行）：%s", window.config)
         return _run_selftest(window, screenshot=screenshot)
 
